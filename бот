@@ -1,0 +1,319 @@
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils import executor
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+import pandas as pd
+from gigachat import GigaChat
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+TOKEN = "7942315281:AAHz_poSfJwBAcmucOpOCY4YXPToMIH1XvQ"
+
+bot = Bot(token=TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
+
+df = pd.read_csv("mal_manga_df.csv")
+
+
+class MangaSearch(StatesGroup):
+    title = State()
+    genres = State()
+    filters = State()
+    analysis = State()
+    comparison = State()
+    podborka = State()
+    filter_choice = State()
+    filter_input = State()
+    filter_page = State()
+    past = State()
+
+
+def find_manga_by_title(title):
+    return df[df['title'].str.contains(title, case=False, na=False)].head(5).to_dict(orient='records')
+
+
+def find_manga_by_genres(genres):
+    filtered_df = df[df['genres'].fillna('').apply(lambda x: any(g in x.lower() for g in genres))]
+    return filtered_df.head(5).to_dict(orient='records')
+
+
+def count_matches(manga, year, author, genres, rating):
+    matches = 0
+    if year and manga['year'] == int(year):
+        matches += 1
+    if author and author.lower() in manga['author'].lower():
+        matches += 1
+    if genres:
+        if any(g.lower() in manga['genres'].lower() for g in genres):
+            matches += 1
+    if rating and manga['score'] >= float(rating):
+        matches += 1
+    return matches
+
+
+def find_manga_by_filters(year=None, author=None, genres=None, rating=None):
+    filtered_df = df.copy()
+    filtered_df['match_count'] = filtered_df.apply(lambda row: count_matches(row, year, author, genres, rating), axis=1)
+    filtered_df = filtered_df[filtered_df['match_count'] > 0]
+    filtered_df = filtered_df.sort_values(by='match_count', ascending=False)
+    return filtered_df
+
+
+async def get_mangas_page(filters, page=0):
+    year = filters.get('year')
+    author = filters.get('author')
+    genres = filters.get('genres')
+    rating = filters.get('rating')
+
+    mangas = find_manga_by_filters(year, author, genres, rating)
+    mangas_sorted = mangas.sort_values(by='match_count', ascending=False)
+
+    start_idx = page * 5
+    end_idx = start_idx + 5
+
+    return mangas_sorted.iloc[start_idx:end_idx]
+
+
+gigaChatKey = "M2U0OWIxNDUtNDZhNS00MjM2LTllYzYtOThkMjc5NzQ5ZTJlOjZlMzQxZWRmLTNlODMtNDVhZi05NDY5LTAxNGI3NjcxZWQ1MA=="
+llm = GigaChat(credentials=gigaChatKey, model='GigaChat:latest', verify_ssl_certs=False)
+
+main_menu = ReplyKeyboardMarkup(resize_keyboard=True)
+main_menu.add(KeyboardButton("Манга по названию"))
+main_menu.add(KeyboardButton("Манги по жанрам"))
+main_menu.add(KeyboardButton("Фильтры"))
+main_menu.add(KeyboardButton("Анализ манги"))
+main_menu.add(KeyboardButton("Предыдущие подборки"))
+main_menu.add(KeyboardButton("Сравнение манг"))
+main_menu.add(KeyboardButton("Подборка по описанию"))
+
+filter_menu = ReplyKeyboardMarkup(resize_keyboard=True)
+filter_menu.add(KeyboardButton("Новые фильтры"))
+filter_menu.add(KeyboardButton("Старые фильтры"))
+filter_menu.add(KeyboardButton("Назад"))
+
+pagination_menu = ReplyKeyboardMarkup(resize_keyboard=True)
+pagination_menu.add(KeyboardButton("Следующая страница"))
+pagination_menu.add(KeyboardButton("Назад"))
+
+user_recommendations = {}
+user_filters = {}
+user_pages = {}
+
+
+@dp.message_handler(commands=['start'])
+async def start(message: types.Message):
+    await message.answer("Привет! Я бот для поиска манги. Выберите действие:", reply_markup=main_menu)
+
+
+@dp.message_handler(lambda message: message.text == "Манга по названию")
+async def manga_by_title(message: types.Message):
+    await message.answer("Введите название манги для поиска:")
+    await MangaSearch.title.set()
+
+
+@dp.message_handler(state=MangaSearch.title)
+async def search_manga_by_title(message: types.Message, state: FSMContext):
+    title = message.text.strip()
+    mangas = find_manga_by_title(title)
+
+    if mangas:
+        response = "\n\n".join(
+            [f"📖 *{m['title']}*\n⭐ Рейтинг: {m.get('score', 'Нет данных')}\n📕 Жанры: {m.get('genres', 'Нет данных')}"
+             for m in mangas])
+    else:
+        response = "❌ Манга с таким названием не найдена."
+
+    user_id = message.from_user.id
+    user_recommendations.setdefault(user_id, []).append(response)
+    logging.info(f"Подборка сохранена для пользователя {user_id}: {response}")
+    await message.answer(response, parse_mode="Markdown", reply_markup=main_menu)
+    await state.finish()
+
+
+@dp.message_handler(lambda message: message.text == "Манги по жанрам")
+async def manga_by_genres(message: types.Message):
+    await message.answer("Введите жанры манги через запятую:")
+    await MangaSearch.genres.set()
+
+
+@dp.message_handler(state=MangaSearch.genres)
+async def search_manga_by_genres(message: types.Message, state: FSMContext):
+    genres = message.text.split(',')
+    genres = [g.strip().lower() for g in genres]
+    mangas = find_manga_by_genres(genres)
+
+    if mangas:
+        response = "\n\n".join(
+            [f"📖 *{m['title']}*\n⭐ Рейтинг: {m.get('score', 'Нет данных')}\n📕 Жанры: {m.get('genres', 'Нет данных')}"
+             for m in mangas])
+    else:
+        response = "❌ Манга с такими жанрами не найдена."
+
+    user_id = message.from_user.id
+    user_recommendations.setdefault(user_id, []).append(response)
+    logging.info(f"Подборка сохранена для пользователя {user_id}: {response}")  # Логируем сохранение
+
+    await message.answer(response, parse_mode="Markdown", reply_markup=main_menu)
+    await state.finish()
+
+
+@dp.message_handler(lambda message: message.text == "Фильтры")
+async def filter_menu_handler(message: types.Message):
+    await message.answer("Выберите действие:", reply_markup=filter_menu)
+    await MangaSearch.filter_choice.set()
+
+
+@dp.message_handler(lambda message: message.text == "Новые фильтры", state=MangaSearch.filter_choice)
+async def new_filters(message: types.Message):
+    await message.answer(
+        "Введите фильтры в формате: критерий: значение (например, 'год: 2020, автор: Харуки'). Вы можете оставить любой параметр пустым.")
+    await MangaSearch.filter_input.set()
+
+
+@dp.message_handler(state=MangaSearch.filter_input)
+async def process_new_filters(message: types.Message, state: FSMContext):
+    filters = message.text.split(',')
+    filter_dict = {'year': None, 'author': None, 'genres': None, 'rating': None}
+
+    for f in filters:
+        f = f.strip().lower()
+        if "год:" in f:
+            filter_dict['year'] = f.replace("год:", "").strip()
+        elif "автор:" in f:
+            filter_dict['author'] = f.replace("автор:", "").strip()
+        elif "жанры:" in f:
+            filter_dict['genres'] = [g.strip() for g in f.replace("жанры:", "").strip().split(';')]
+        elif "рейтинг:" in f:
+            try:
+                filter_dict['rating'] = float(f.replace("рейтинг:", "").strip())
+            except ValueError:
+                filter_dict['rating'] = None
+
+    user_filters[message.from_user.id] = filter_dict
+    user_pages[message.from_user.id] = 0
+    await state.finish()
+    await old_filters(message, state)
+
+
+@dp.message_handler(lambda message: message.text == "Старые фильтры", state=MangaSearch.filter_choice)
+async def old_filters(message: types.Message, state: FSMContext):
+    filters = user_filters.get(message.from_user.id)
+    if not filters:
+        await message.answer("❌ У вас нет сохраненных фильтров.", reply_markup=main_menu)
+        await state.finish()
+        return
+
+    user_pages[message.from_user.id] = 0
+    mangas_page = await get_mangas_page(filters, page=user_pages[message.from_user.id])
+    if mangas_page.empty:
+        await message.answer("❌ Манга по данным фильтрам не найдена.", reply_markup=main_menu)
+    else:
+        response = "\n\n".join([
+            f"📖 *{m['title']}*\n⭐ Рейтинг: {m.get('score', 'Нет данных')}\n📕 Жанры: {m.get('genres', 'Нет данных')}"
+            for _, m in mangas_page.iterrows()])
+        user_id = message.from_user.id
+        user_recommendations.setdefault(user_id, []).append(response)
+        logging.info(f"Подборка сохранена для пользователя {user_id}: {response}")  # Логируем сохранение
+
+        await message.answer(response, parse_mode="Markdown", reply_markup=main_menu)
+
+    await state.finish()
+
+
+@dp.message_handler(lambda message: message.text == "Назад", state=MangaSearch.filter_choice)
+async def back_to_main_menu(message: types.Message):
+    await message.answer("Возвращаемся в главное меню.", reply_markup=main_menu)
+    await MangaSearch.filter_choice.finish()
+
+
+@dp.message_handler(lambda message: message.text == "Анализ манги")
+async def analyze_manga(message: types.Message):
+    await message.answer("Введите название манги для анализа:")
+    await MangaSearch.analysis.set()
+
+
+@dp.message_handler(state=MangaSearch.analysis)
+async def get_manga_analysis(message: types.Message, state: FSMContext):
+    title = message.text.strip()
+    manga = find_manga_by_title(title)
+
+    if manga:
+        analysis_text = llm.chat(f"Проанализируй мангу {title}. Дай краткое описание сюжета и оценку.")
+        result_text = analysis_text.choices[0].message.content
+        await message.answer(result_text)
+        user_recommendations.setdefault(message.from_user.id, []).append(f"📖 *{title}* - {result_text}")
+    else:
+        await message.answer("❌ Манга с таким названием не найдена.")
+
+    await state.finish()
+
+
+@dp.message_handler(lambda message: message.text == "Сравнение манг")
+async def compare_mangas(message: types.Message):
+    await message.answer("Введите названия манг для сравнения, разделённые запятой:")
+    await MangaSearch.comparison.set()
+
+
+@dp.message_handler(state=MangaSearch.comparison)
+async def get_manga_comparison(message: types.Message, state: FSMContext):
+    titles = message.text.split(',')
+    if titles:
+        comparison_text = llm.chat(
+            f"Сравни очень коротко манги {titles}. Какие особенности и различия у этих манг?")
+        result_text = comparison_text.choices[0].message.content
+        await message.answer(result_text)
+        user_recommendations.setdefault(message.from_user.id, []).append(
+            f"📖 Сравнение: {result_text}")
+    else:
+        await message.answer("❌ Манги не найдены.")
+
+    await state.finish()
+
+
+@dp.message_handler(lambda message: message.text == "Подборка по описанию")
+async def description_based_podborka(message: types.Message):
+    await message.answer("Введите описание, по которому вы хотите получить подборку манги:")
+    await MangaSearch.podborka.set()
+
+
+@dp.message_handler(state=MangaSearch.podborka)
+async def get_podborka_by_description(message: types.Message, state: FSMContext):
+    description = message.text.strip()
+    podborka_text = llm.chat(f"Найди мангу по описанию: {description}")
+    result_text = podborka_text.choices[0].message.content
+    await message.answer(result_text)
+    user_recommendations.setdefault(message.from_user.id, []).append(f"Подборка по описанию: {result_text}")
+
+    await state.finish()
+
+
+@dp.message_handler(lambda message: message.text == "Предыдущие подборки")
+async def past_recommendations(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in user_recommendations or not user_recommendations[user_id]:
+        await message.answer("❌ У вас нет предыдущих подборок.", reply_markup=main_menu)
+        return
+
+    recommendations = user_recommendations[user_id]
+    logging.info(f"Подборки пользователя {user_id}: {recommendations}")
+    response = "📚 Ваши предыдущие подборки:\n\n" + "\n\n".join(recommendations)
+    await message.answer(response, parse_mode="Markdown", reply_markup=main_menu)
+
+
+@dp.message_handler()
+async def handle_unknown(message: types.Message):
+    user_input = message.text.strip()
+
+    if user_input not in ["Манга по названию", "Манги по жанрам", "Фильтры", "Анализ манги", "Сравнение манг", "Подборка по описанию", "Предыдущие подборки"]:
+        response = llm.chat(f"Пользователь написал: '{user_input}'.Если запрос расплывчатый, то задай вопрос, если понятный, то выдавай 5 манга в качестве рекомендации")
+        bot_response = response.choices[0].message.content
+
+        await message.answer(bot_response, parse_mode="Markdown", reply_markup=main_menu)
+
+
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)
